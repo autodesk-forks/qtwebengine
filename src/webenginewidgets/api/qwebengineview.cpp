@@ -177,6 +177,11 @@ public:
             return root->windowHandle();
         return nullptr;
     }
+    void SetCursor(const QCursor &cursor) override
+    {
+        if (auto parentWidget = QQuickWidget::parentWidget())
+            parentWidget->setCursor(cursor);
+    }
 
 protected:
     void closeEvent(QCloseEvent *event) override
