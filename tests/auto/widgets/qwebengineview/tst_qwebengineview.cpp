@@ -184,6 +184,8 @@ private Q_SLOTS:
     void navigateOnDrop();
     void datalist();
     void longKeyEventText();
+    //void pageWithPaintListeners();
+    void deferredDelete();
 };
 
 // This will be called before the first test function is executed.
@@ -3833,6 +3835,20 @@ void tst_QWebEngineView::longKeyEventText()
     QKeyEvent event(QKeyEvent::KeyPress, key, Qt::NoModifier, QKeySequence(key).toString());
     QApplication::sendEvent(view.focusProxy(), &event);
     QTRY_VERIFY(consoleMessageSpy.size());
+}
+
+void tst_QWebEngineView::deferredDelete()
+{
+    {
+        QWebEngineView view;
+        QSignalSpy loadFinishedSpy(view.page(), &QWebEnginePage::loadFinished);
+        view.load(QUrl("chrome://qt"));
+        view.show();
+        QTRY_VERIFY(loadFinishedSpy.size());
+        QCOMPARE(QApplication::allWidgets().size(), 2); // QWebEngineView and WebEngineQuickWidget
+    }
+
+    QCOMPARE(QApplication::allWidgets().size(), 0);
 }
 
 QTEST_MAIN(tst_QWebEngineView)
