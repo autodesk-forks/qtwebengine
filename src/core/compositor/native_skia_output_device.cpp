@@ -24,6 +24,16 @@
 #include <d3d11_1.h>
 #endif
 
+// Chromium Overlay representation calls AcquireSync/ReleaseSync of the d3d texture belonging to Chromium angle device.
+// It's safe to access it only in Chromium GPU thread. Using the Overlay representation in Qt rendering thread is
+// unsafe. HANDLE is passed form Chromium GPU thread to Qt rendering thread. Then, it's imported to Qt d3d device. It's
+// safe to access the imported d3d texture in Qt rendering thread.
+#if defined(Q_OS_WIN)
+static constexpr bool kGetNativeHandleInChromiumGpuThread = true;
+#else
+static constexpr bool kGetNativeHandleInChromiumGpuThread = false;
+#endif
+
 #include <QQuickWindow>
 
 namespace QtWebEngineCore {
@@ -51,6 +61,20 @@ public:
     // found in the LICENSE file.
     bool initialize()
     {
+        // When sharing d3d textures between different d3d devices, GPU synchronization is needed. Qt imports the native
+        // handle from Chromium. Either keyed mutex or d3d fences can be used to synchronize between Qt and Chromium.
+        // Only Windows 10 Creator Update and later support d3d11 fence. So keyed mutex is chosen here because it's
+        // widely available.
+        // SHARED_IMAGE_USAGE_WEBGPU adds D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX to MiscFlags when creating the shared
+        // d3d texture in d3d_image_backing_factory.cc. This only works with the Chromium versions in Qt 6.5.x.
+        // The newer Chromium dynamically switches between fence and keyed mutex based on gfx::D3DSharedFence::IsSupported.
+        // The related code needs to be patched to add D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX for Qt 6.8.x and later.
+        static const uint32_t kKeyedMutexUsage =
+#if defined(Q_OS_WIN)
+            gpu::SHARED_IMAGE_USAGE_WEBGPU;
+#else
+            0;
+#endif
         static const uint32_t kDefaultSharedImageUsage =
                 gpu::SHARED_IMAGE_USAGE_SCANOUT | gpu::SHARED_IMAGE_USAGE_DISPLAY_READ
               | gpu::SHARED_IMAGE_USAGE_DISPLAY_WRITE | gpu::SHARED_IMAGE_USAGE_GLES2_FRAMEBUFFER_HINT;
@@ -64,7 +88,7 @@ public:
                                                         ? kTopLeft_GrSurfaceOrigin
                                                         : kBottomLeft_GrSurfaceOrigin,
                                                     kPremul_SkAlphaType,
-                                                    m_parent->m_deps->GetSurfaceHandle(), kDefaultSharedImageUsage)) {
+                                                    m_parent->m_deps->GetSurfaceHandle(), kDefaultSharedImageUsage | kKeyedMutexUsage)) {
             LOG(ERROR) << "CreateSharedImage failed.";
             return false;
         }
@@ -138,23 +162,27 @@ public:
     void beginPresent()
     {
         if (++m_presentCount != 1) {
-            DCHECK(m_scopedOverlayReadAccess);
+            DCHECK(!kGetNativeHandleInChromiumGpuThread ? !!m_scopedOverlayReadAccess : !m_scopedOverlayReadAccess);
             return;
         }
 
         DCHECK(!m_scopedSkiaWriteAccess);
         DCHECK(!m_scopedOverlayReadAccess);
 
-        m_scopedOverlayReadAccess = m_overlayRepresentation->BeginScopedReadAccess(true);
-        DCHECK(m_scopedOverlayReadAccess);
-        m_acquireFence = TakeGpuFence(m_scopedOverlayReadAccess->TakeAcquireFence());
+        if (!kGetNativeHandleInChromiumGpuThread) {
+            m_scopedOverlayReadAccess = m_overlayRepresentation->BeginScopedReadAccess(true);
+            DCHECK(m_scopedOverlayReadAccess);
+            m_acquireFence = TakeGpuFence(m_scopedOverlayReadAccess->TakeAcquireFence());
+        } else {
+            DCHECK(!m_scopedOverlayReadAccess);
+        }
     }
 
     void endPresent()
     {
         if (!m_presentCount)
             return;
-        DCHECK(m_scopedOverlayReadAccess);
+        DCHECK(!kGetNativeHandleInChromiumGpuThread ? !!m_scopedOverlayReadAccess : !m_scopedOverlayReadAccess);
         if (--m_presentCount)
             return;
 
@@ -163,7 +191,59 @@ public:
             m_textureCleanup();
             m_textureCleanup = nullptr;
         }
+
+#if defined(Q_OS_WIN)
+        if (kGetNativeHandleInChromiumGpuThread) {
+            m_nativeHandle.Close();
+        }
+#endif
     }
+
+#if defined(Q_OS_WIN)
+    HANDLE getNativeHandle()
+    {
+        DCHECK(kGetNativeHandleInChromiumGpuThread && !m_scopedOverlayReadAccess);
+        return m_nativeHandle.get();
+    }
+#endif
+
+    void setNativeHandleFromChromiumIfNecessary()
+    {
+#if defined(Q_OS_WIN)
+        if (kGetNativeHandleInChromiumGpuThread) {
+            DCHECK(!m_scopedOverlayReadAccess);
+
+            m_nativeHandle.Close();
+
+            m_scopedOverlayReadAccess = m_overlayRepresentation->BeginScopedReadAccess(true);
+            DCHECK(m_scopedOverlayReadAccess);
+            m_acquireFence = TakeGpuFence(m_scopedOverlayReadAccess->TakeAcquireFence());
+
+            if (m_acquireFence) {
+                m_acquireFence->Wait();
+                m_acquireFence.reset();
+            }
+
+            gl::GLImageD3D* gl_image_d3d = gl::GLImageD3D::FromGLImage(m_scopedOverlayReadAccess->gl_image());
+            if (gl_image_d3d) {
+                HANDLE sharedHandle = gl_image_d3d->shared_handle();
+                if (sharedHandle) {
+                    HANDLE sharedHandleDup;
+                    DuplicateHandle(GetCurrentProcess(), sharedHandle, GetCurrentProcess(), &sharedHandleDup, 0, FALSE, DUPLICATE_SAME_ACCESS);
+                    m_nativeHandle.Set(sharedHandleDup);
+                } else {
+                    qWarning() << "No shared handle";
+                }
+
+            }
+
+            m_scopedOverlayReadAccess.reset();
+        }
+#else
+        DCHECK(!kGetNativeHandleInChromiumGpuThread);
+#endif
+    }
+
     gl::GLImage *glImage()
     {
         DCHECK(m_presentCount);
@@ -206,6 +286,10 @@ private:
 
     std::vector<GrBackendSemaphore> m_endSemaphores;
     int m_presentCount = 0;
+
+#if defined(Q_OS_WIN)
+    base::win::ScopedHandle m_nativeHandle;
+#endif
 };
 
 NativeSkiaOutputDevice::NativeSkiaOutputDevice(
@@ -268,6 +352,7 @@ void NativeSkiaOutputDevice::SwapBuffers(BufferPresentedCallback feedback,
     {
         QMutexLocker locker(&m_mutex);
         m_backBuffer->createFence();
+        m_backBuffer->setNativeHandleFromChromiumIfNecessary();
         m_taskRunner = base::ThreadTaskRunnerHandle::Get();
         std::swap(m_middleBuffer, m_backBuffer);
         m_readyToUpdate = true;
@@ -364,20 +449,10 @@ QSGTexture *NativeSkiaOutputDevice::texture(QQuickWindow *win, uint32_t textureO
     Q_ASSERT(QQuickWindow::graphicsApi() == QSGRendererInterface::Direct3D11);
 
     QSGTexture *texture = nullptr;
-    gl::GLImageD3D *gl_image_d3d = gl::GLImageD3D::FromGLImage(m_frontBuffer->glImage());
-    if (gl_image_d3d) {
+    HANDLE sharedHandleDup = m_frontBuffer->getNativeHandle();
+    if (sharedHandleDup) {
         // Pass texture between two D3D devices:
         HRESULT status = S_OK;
-        HANDLE sharedHandle;
-        sharedHandle = gl_image_d3d->shared_handle();
-        if (!sharedHandle) {
-            qWarning() << "No shared handle";
-            return nullptr;
-        }
-        Q_ASSERT(sharedHandle);
-
-        HANDLE sharedHandleDup;
-        DuplicateHandle(GetCurrentProcess(), sharedHandle, GetCurrentProcess(), &sharedHandleDup, 0, FALSE, DUPLICATE_SAME_ACCESS);
 
         QSGRendererInterface *ri = win->rendererInterface();
         ID3D11Device1 *device = static_cast<ID3D11Device1 *>(ri->getResource(win, QSGRendererInterface::DeviceResource));
@@ -386,15 +461,23 @@ QSGTexture *NativeSkiaOutputDevice::texture(QQuickWindow *win, uint32_t textureO
         status = device->OpenSharedResource1(sharedHandleDup, __uuidof(ID3D11Texture2D), (void**)&qtTexture);
         Q_ASSERT(status == S_OK);
 
+        IDXGIKeyedMutex *qtKeyedMutex;
+        status = qtTexture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&qtKeyedMutex);
+        Q_ASSERT(status == S_OK);
+
+        status = qtKeyedMutex->AcquireSync(gpu::kDXGIKeyedMutexAcquireKey, INFINITE);
+        Q_ASSERT(status == S_OK);
+
         QQuickWindow::CreateTextureOptions texOpts(textureOptions);
         texture = QNativeInterface::QSGD3D11Texture::fromNative(qtTexture, win, size(), texOpts);
 
-        m_frontBuffer->m_textureCleanup = [qtTexture,sharedHandleDup]() {
+        m_frontBuffer->m_textureCleanup = [qtTexture, qtKeyedMutex]() {
+            qtKeyedMutex->ReleaseSync(gpu::kDXGIKeyedMutexAcquireKey);
+            qtKeyedMutex->Release();
             qtTexture->Release();
-            ::CloseHandle(sharedHandleDup);
         };
     } else {
-        qWarning() << "GLImage is not D3D";
+        qWarning() << "No shared handle from Chromium GPU thread";
     }
 
     return texture;
