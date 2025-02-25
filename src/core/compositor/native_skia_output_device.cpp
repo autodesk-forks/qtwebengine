@@ -510,6 +510,10 @@ QSGTexture *NativeSkiaOutputDevice::texture(QQuickWindow *win, uint32_t textureO
         ID3D11Texture2D *qtTexture;
         status = device->OpenSharedResource1(sharedHandleDup, __uuidof(ID3D11Texture2D), (void**)&qtTexture);
         Q_ASSERT(status == S_OK);
+        if (!qtTexture) {
+            qWarning() << "Failed to import shared texture from Chromium. device removed ?";
+            return texture;
+        }
 
         IDXGIKeyedMutex *qtKeyedMutex;
         status = qtTexture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&qtKeyedMutex);
