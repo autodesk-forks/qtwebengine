@@ -51,6 +51,8 @@ public:
         if (m_scopedSkiaWriteAccess)
             endWriteSkia(false);
 
+        cleanupTextureMutex();
+
         if (!m_mailbox.IsZero())
             m_parent->m_factory->DestroySharedImage(m_mailbox);
     }
@@ -264,9 +266,50 @@ public:
         }
     }
 
+    void acquireTextureMutex()
+    {
+        if (m_textureMutexAcquire) {
+            if (++m_textureMutexAcquireCount != 1)
+                return;
+            m_textureMutexAcquire();
+        }
+    }
+
+    void releaseTextureMutex()
+    {
+        if (m_textureMutexRelease) {
+            if (!m_textureMutexAcquireCount)
+                return;
+            if (--m_textureMutexAcquireCount)
+                return;
+            m_textureMutexRelease();
+        }
+    }
+
+    void cleanupTextureMutex()
+    {
+        if (m_textureMutexAcquire) {
+            m_textureMutexAcquire = nullptr;
+        }
+        if (m_textureMutexRelease) {
+            if (m_textureMutexAcquireCount) {
+                m_textureMutexRelease();
+                m_textureMutexAcquireCount = 0;
+            }
+            m_textureMutexRelease = nullptr;
+        }
+        if (m_textureMutexCleanup) {
+            m_textureMutexCleanup();
+            m_textureMutexCleanup = nullptr;
+        }
+    }
+
     const Shape &shape() const { return m_shape; }
 
     std::function<void()> m_textureCleanup;
+    std::function<void()> m_textureMutexAcquire;
+    std::function<void()> m_textureMutexRelease;
+    std::function<void()> m_textureMutexCleanup;
 private:
     NativeSkiaOutputDevice *m_parent;
     Shape m_shape;
@@ -286,6 +329,7 @@ private:
 
     std::vector<GrBackendSemaphore> m_endSemaphores;
     int m_presentCount = 0;
+    int m_textureMutexAcquireCount = 0;
 
 #if defined(Q_OS_WIN)
     base::win::ScopedHandle m_nativeHandle;
@@ -395,6 +439,8 @@ void NativeSkiaOutputDevice::swapFrame()
 {
     QMutexLocker locker(&m_mutex);
     if (m_readyToUpdate) {
+        if (m_frontBuffer)
+            m_frontBuffer->cleanupTextureMutex();
         std::swap(m_frontBuffer, m_middleBuffer);
         m_taskRunner->PostTask(FROM_HERE,
                                base::BindOnce(&NativeSkiaOutputDevice::SwapBuffersFinished,
@@ -412,10 +458,14 @@ void NativeSkiaOutputDevice::waitForTexture()
 {
     if (m_readyWithTexture)
         m_frontBuffer->consumeFence();
+    if (m_frontBuffer)
+        m_frontBuffer->acquireTextureMutex();
 }
 
 void NativeSkiaOutputDevice::releaseTexture()
 {
+    if (m_frontBuffer)
+        m_frontBuffer->releaseTextureMutex();
     if (m_readyWithTexture) {
         m_frontBuffer->endPresent();
         m_readyWithTexture = false;
@@ -465,16 +515,25 @@ QSGTexture *NativeSkiaOutputDevice::texture(QQuickWindow *win, uint32_t textureO
         status = qtTexture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&qtKeyedMutex);
         Q_ASSERT(status == S_OK);
 
-        status = qtKeyedMutex->AcquireSync(gpu::kDXGIKeyedMutexAcquireKey, INFINITE);
-        Q_ASSERT(status == S_OK);
-
         QQuickWindow::CreateTextureOptions texOpts(textureOptions);
         texture = QNativeInterface::QSGD3D11Texture::fromNative(qtTexture, win, size(), texOpts);
 
         m_frontBuffer->m_textureCleanup = [qtTexture, qtKeyedMutex]() {
-            qtKeyedMutex->ReleaseSync(gpu::kDXGIKeyedMutexAcquireKey);
-            qtKeyedMutex->Release();
             qtTexture->Release();
+        };
+
+        m_frontBuffer->m_textureMutexAcquire = [qtKeyedMutex]() {
+            HRESULT status = qtKeyedMutex->AcquireSync(gpu::kDXGIKeyedMutexAcquireKey, INFINITE);
+            Q_ASSERT(status == S_OK);
+        };
+
+        m_frontBuffer->m_textureMutexRelease = [qtKeyedMutex]() {
+            HRESULT status = qtKeyedMutex->ReleaseSync(gpu::kDXGIKeyedMutexAcquireKey);
+            Q_ASSERT(status == S_OK);
+        };
+
+        m_frontBuffer->m_textureMutexCleanup = [qtKeyedMutex]() {
+            qtKeyedMutex->Release();
         };
     } else {
         qWarning() << "No shared handle from Chromium GPU thread";
