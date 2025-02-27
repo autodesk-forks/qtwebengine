@@ -351,6 +351,12 @@ bool WebEngineQuickWidget::event(QEvent *event)
     } else
         handled = m_contentItem->m_client->forwardEvent(event);
 
+    if (event->type() == QEvent::WindowChangeInternal) {
+        // Request a force redraw on device lost. Chromium will detect the device lost, create a
+        // software renderer and send a new frame to compositor.
+        m_contentItem->m_client->forceRedraw();
+    }
+
     if (!handled)
         return QQuickWidget::event(event);
     event->accept();

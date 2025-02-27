@@ -203,6 +203,11 @@ void RenderWidgetHostViewQtDelegateClient::visualPropertiesChanged()
         m_rwhv->synchronizeVisualProperties(absl::nullopt);
 }
 
+void RenderWidgetHostViewQtDelegateClient::forceRedraw()
+{
+    m_rwhv->host()->RequestForceRedraw(0);
+}
+
 bool RenderWidgetHostViewQtDelegateClient::forwardEvent(QEvent *event)
 {
     Q_ASSERT(m_rwhv->host()->GetView());

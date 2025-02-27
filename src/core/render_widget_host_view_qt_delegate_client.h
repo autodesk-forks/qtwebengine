@@ -55,6 +55,7 @@ public:
     void notifyShown();
     void notifyHidden();
     void visualPropertiesChanged();
+    void forceRedraw();
     bool forwardEvent(QEvent *);
     QVariant inputMethodQuery(Qt::InputMethodQuery query);
     void closePopup();
