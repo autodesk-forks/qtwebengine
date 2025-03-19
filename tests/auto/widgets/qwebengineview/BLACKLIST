@@ -11,3 +11,6 @@ windows
 b2qt # different scrollbar
 macos
 rhel # flaky
+
+[setCursorOnEmbeddedView]
+macos # QTest::mousemove is not reliable

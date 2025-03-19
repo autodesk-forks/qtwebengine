@@ -131,6 +131,11 @@ public:
     void Destroy() override
     {
         deleteLater();
+
+        // The event loop may be exited at this point.
+        // Ensure deferred deletion in this scenario.
+        if (QThread::currentThread()->loopLevel() == 0)
+            QCoreApplication::sendPostedEvents(this, QEvent::DeferredDelete);
     }
 
     bool ActiveFocusOnPress() override
@@ -171,6 +176,11 @@ public:
         if (const QWidget *root = QQuickWidget::window())
             return root->windowHandle();
         return nullptr;
+    }
+    void SetCursor(const QCursor &cursor) override
+    {
+        if (auto parentWidget = QQuickWidget::parentWidget())
+            parentWidget->setCursor(cursor);
     }
 
 protected:
@@ -340,6 +350,12 @@ bool WebEngineQuickWidget::event(QEvent *event)
         handled = m_contentItem->m_client->forwardEvent(&press);
     } else
         handled = m_contentItem->m_client->forwardEvent(event);
+
+    if (event->type() == QEvent::WindowChangeInternal) {
+        // Request a force redraw on device lost. Chromium will detect the device lost, create a
+        // software renderer and send a new frame to compositor.
+        m_contentItem->m_client->forceRedraw();
+    }
 
     if (!handled)
         return QQuickWidget::event(event);

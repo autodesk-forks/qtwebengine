@@ -301,7 +301,9 @@ content::WebContentsAccessibility *RenderWidgetHostViewQt::GetWebContentsAccessi
 
 QObject *WebContentsAccessibilityQt::accessibilityParentObject() const
 {
-    return m_rwhv->m_adapterClient->accessibilityParentObject();
+    if (m_rwhv && m_rwhv->m_adapterClient)
+        return m_rwhv->m_adapterClient->accessibilityParentObject();
+    return nullptr;
 }
 
 // Set focus to the associated View component.
