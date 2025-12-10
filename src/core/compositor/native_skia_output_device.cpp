@@ -97,6 +97,7 @@ void NativeSkiaOutputDevice::Present(const absl::optional<gfx::Rect> &update_rec
     {
         QMutexLocker locker(&m_mutex);
         m_backBuffer->createFence();
+        m_backBuffer->shareTextureHandleOnGPUThread();
         m_gpuTaskRunner = base::SingleThreadTaskRunner::GetCurrentDefault();
         std::swap(m_middleBuffer, m_backBuffer);
         m_readyToUpdate = true;
@@ -160,10 +161,14 @@ void NativeSkiaOutputDevice::waitForTexture()
 {
     if (m_readyWithTexture)
         m_frontBuffer->consumeFence();
+    if (m_frontBuffer)
+        m_frontBuffer->acquireTextureMutex();
 }
 
 void NativeSkiaOutputDevice::releaseTexture()
 {
+    if (m_frontBuffer)
+        m_frontBuffer->releaseTextureMutex();
     if (m_readyWithTexture) {
         m_frontBuffer->endPresent();
         m_readyWithTexture = false;
@@ -217,6 +222,8 @@ NativeSkiaOutputDevice::Buffer::~Buffer()
 {
     if (m_scopedSkiaWriteAccess)
         endWriteSkia(false);
+
+    cleanupTextureMutex();
 
     if (!m_mailbox.IsZero() && m_parent->m_factory)
         m_parent->m_factory->DestroySharedImage(m_mailbox);
@@ -332,6 +339,74 @@ std::vector<GrBackendSemaphore> NativeSkiaOutputDevice::Buffer::takeEndWriteSkia
     return std::exchange(m_endSemaphores, {});
 }
 
+void NativeSkiaOutputDevice::Buffer::shareTextureHandleOnGPUThread()
+{
+#if defined(Q_OS_WIN)
+    // Chromium Overlay representation calls AcquireSync/ReleaseSync of the d3d texture belonging to
+    // Chromium d3d device. It's safe to access it only on Chromium GPU Thread. It's unsafe to use
+    // the texture in Qt rendering thread. So we create a copy of the texture handle and share it
+    // with Qt rendering thread.
+    if (m_parent->m_needShareTextureHandleOnGPUThread) {
+        DCHECK(!m_scopedOverlayReadAccess);
+
+        m_textureHandle.Close();
+
+        m_scopedOverlayReadAccess = m_overlayRepresentation->BeginScopedReadAccess();
+        DCHECK(m_scopedOverlayReadAccess);
+        m_acquireFence = TakeGpuFence(m_scopedOverlayReadAccess->TakeAcquireFence());
+
+        if (m_acquireFence) {
+            m_acquireFence->Wait();
+            m_acquireFence.reset();
+        }
+
+        m_parent->shareTextureHandleOnGPUThreadImplementation(this, m_scopedOverlayReadAccess.get());
+
+        m_scopedOverlayReadAccess.reset();
+    }
+#else
+    DCHECK(!m_parent->m_needShareTextureHandleOnGPUThread);
+#endif
+}
+
+void NativeSkiaOutputDevice::Buffer::acquireTextureMutex()
+{
+    if (textureMutexAcquireCallback) {
+        if (++m_textureMutexAcquireCount != 1)
+            return;
+        textureMutexAcquireCallback();
+    }
+}
+
+void NativeSkiaOutputDevice::Buffer::releaseTextureMutex()
+{
+    if (textureMutexReleaseCallback) {
+        if (!m_textureMutexAcquireCount)
+            return;
+        if (--m_textureMutexAcquireCount)
+            return;
+        textureMutexReleaseCallback();
+    }
+}
+
+void NativeSkiaOutputDevice::Buffer::cleanupTextureMutex()
+{
+    if (textureMutexAcquireCallback) {
+        textureMutexAcquireCallback = nullptr;
+    }
+    if (textureMutexReleaseCallback) {
+        if (m_textureMutexAcquireCount) {
+            textureMutexReleaseCallback();
+            m_textureMutexAcquireCount = 0;
+        }
+        textureMutexReleaseCallback = nullptr;
+    }
+    if (textureMutexCleanupCallback) {
+        textureMutexCleanupCallback();
+        textureMutexCleanupCallback = nullptr;
+    }
+}
+
 void NativeSkiaOutputDevice::Buffer::createSkImageOnGPUThread()
 {
     if (!m_scopedSkiaReadAccess) {
@@ -347,6 +422,12 @@ void NativeSkiaOutputDevice::Buffer::createSkImageOnGPUThread()
 
 void NativeSkiaOutputDevice::Buffer::beginPresent()
 {
+    if (m_parent->m_needShareTextureHandleOnGPUThread) {
+        DCHECK(!m_scopedOverlayReadAccess && !m_scopedSkiaReadAccess);
+        ++m_presentCount;
+        return;
+    }
+
     if (++m_presentCount != 1) {
         DCHECK(m_scopedOverlayReadAccess || m_scopedSkiaReadAccess);
         return;
@@ -379,6 +460,13 @@ void NativeSkiaOutputDevice::Buffer::endPresent()
 {
     if (!m_presentCount)
         return;
+
+    if (m_parent->m_needShareTextureHandleOnGPUThread) {
+        DCHECK(!m_scopedOverlayReadAccess && !m_scopedSkiaReadAccess);
+        --m_presentCount;
+        return;
+    }
+
     DCHECK(m_scopedOverlayReadAccess || m_scopedSkiaReadAccess);
     if (--m_presentCount)
         return;
@@ -395,10 +483,18 @@ void NativeSkiaOutputDevice::Buffer::endPresent()
 
 void NativeSkiaOutputDevice::Buffer::freeTexture()
 {
+    cleanupTextureMutex();
+
     if (textureCleanupCallback) {
         textureCleanupCallback();
         textureCleanupCallback = nullptr;
     }
+
+#if defined(Q_OS_WIN)
+    if (m_parent->m_needShareTextureHandleOnGPUThread) {
+        m_textureHandle.Close();
+    }
+#endif
 }
 
 void NativeSkiaOutputDevice::Buffer::createFence()
@@ -441,6 +537,19 @@ gfx::ScopedIOSurface NativeSkiaOutputDevice::Buffer::ioSurface() const
 {
     DCHECK(m_presentCount);
     return m_scopedOverlayReadAccess->GetIOSurface();
+}
+#endif
+
+#if defined(Q_OS_WIN)
+void NativeSkiaOutputDevice::Buffer::sharedTextureHandle(HANDLE textureHandle)
+{
+    m_textureHandle.Set(textureHandle);
+}
+HANDLE NativeSkiaOutputDevice::Buffer::sharedTextureHandle() const
+{
+    DCHECK(m_parent->m_needShareTextureHandleOnGPUThread);
+    DCHECK(!m_scopedOverlayReadAccess);
+    return m_textureHandle.get();
 }
 #endif
 

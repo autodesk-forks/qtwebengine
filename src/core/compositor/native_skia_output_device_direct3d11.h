@@ -21,6 +21,11 @@ public:
 
     // Overridden from Compositor:
     QSGTexture *texture(QQuickWindow *win, uint32_t textureOptions) override;
+
+    // Overridden from NativeSkiaOutputDevice:
+    void shareTextureHandleOnGPUThreadImplementation(
+            Buffer *buffer,
+            gpu::OverlayImageRepresentation::ScopedReadAccess *scopedOverlayReadAccess) override;
 };
 
 } // namespace QtWebEngineCore
