@@ -21,6 +21,7 @@ NativeSkiaOutputDeviceDirect3D11::NativeSkiaOutputDeviceDirect3D11(
                              shared_image_factory, shared_image_representation_factory,
                              didSwapBufferCompleteCallback)
 {
+    m_needShareTextureHandleOnGPUThread = true;
     qCDebug(lcWebEngineCompositor, "Native Skia Output Device: Direct3D11");
 
     SkColorType skColorType = kRGBA_8888_SkColorType;
@@ -37,32 +38,21 @@ QSGTexture *NativeSkiaOutputDeviceDirect3D11::texture(QQuickWindow *win, uint32_
     if (!m_frontBuffer || !m_readyWithTexture)
         return nullptr;
 
-    absl::optional<gl::DCLayerOverlayImage> overlayImage = m_frontBuffer->overlayImage();
-    if (!overlayImage) {
-        qWarning("D3D: No overlay image.");
-        return nullptr;
-    }
-
     qCDebug(lcWebEngineCompositor, "D3D: Importing DXGI Resource into D3D11 Texture.");
 
-    Q_ASSERT(overlayImage->type() == gl::DCLayerOverlayType::kNV12Texture);
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> chromeTexture = overlayImage->nv12_texture();
-    if (!chromeTexture) {
-        qWarning("D3D: No D3D texture.");
+    // The texture handle has been created from the d3d texture on Chromium GPU thread.
+    HANDLE textureHandle = m_frontBuffer->sharedTextureHandle();
+    if (textureHandle == NULL || textureHandle == INVALID_HANDLE_VALUE) {
+        qWarning("D3D: No texture handle.");
         return nullptr;
     }
 
-    HRESULT hr;
-
-    Microsoft::WRL::ComPtr<IDXGIResource1> dxgiResource;
-    hr = chromeTexture->QueryInterface(IID_PPV_ARGS(&dxgiResource));
-    Q_ASSERT(SUCCEEDED(hr));
-
+    // There is actually no need to duplicate but removing CloseHandle() will cause a lot of diffs.
     HANDLE sharedHandle = INVALID_HANDLE_VALUE;
-    hr = dxgiResource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr,
-                                          &sharedHandle);
-    Q_ASSERT(SUCCEEDED(hr));
-    Q_ASSERT(sharedHandle != INVALID_HANDLE_VALUE);
+    DuplicateHandle(GetCurrentProcess(), textureHandle, GetCurrentProcess(), &sharedHandle, 0,
+                    FALSE, DUPLICATE_SAME_ACCESS);
+
+    HRESULT hr;
 
     // Pass texture between two D3D devices:
     QSGRendererInterface *ri = win->rendererInterface();
@@ -89,6 +79,19 @@ QSGTexture *NativeSkiaOutputDeviceDirect3D11::texture(QQuickWindow *win, uint32_
     }
     Q_ASSERT(qtTexture);
 
+    if (!qtTexture) {
+        qWarning() << "D3D: Failed to import shared texture from Chromium. device removed ?";
+        ::CloseHandle(sharedHandle);
+        return nullptr;
+    }
+
+    // If this fails, check D3DImageBackingFactory::CreateSharedImage() in d3d_image_backing_factory.cc
+    // "QWE_SharedImageBuffer" should be created with D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX flag.
+
+    IDXGIKeyedMutex *qtKeyedMutex = nullptr;
+    hr = qtTexture->QueryInterface(IID_PPV_ARGS(&qtKeyedMutex));
+    Q_ASSERT(hr == S_OK);
+
     QQuickWindow::CreateTextureOptions texOpts(textureOptions);
     QSGTexture *texture =
             QNativeInterface::QSGD3D11Texture::fromNative(qtTexture, win, size(), texOpts);
@@ -98,7 +101,64 @@ QSGTexture *NativeSkiaOutputDeviceDirect3D11::texture(QQuickWindow *win, uint32_
         ::CloseHandle(sharedHandle);
     };
 
+     m_frontBuffer->textureMutexAcquireCallback = [qtKeyedMutex]() {
+        HRESULT hr = qtKeyedMutex->AcquireSync(gpu::kDXGIKeyedMutexAcquireKey, INFINITE);
+        Q_ASSERT(hr == S_OK);
+    };
+
+    m_frontBuffer->textureMutexReleaseCallback = [qtKeyedMutex]() {
+        HRESULT hr = qtKeyedMutex->ReleaseSync(gpu::kDXGIKeyedMutexAcquireKey);
+        Q_ASSERT(hr == S_OK);
+    };
+
+    m_frontBuffer->textureMutexCleanupCallback = [qtKeyedMutex]() {
+        qtKeyedMutex->Release(); //
+    };
+
     return texture;
+}
+
+void NativeSkiaOutputDeviceDirect3D11::shareTextureHandleOnGPUThreadImplementation(
+        Buffer *buffer, gpu::OverlayImageRepresentation::ScopedReadAccess *scopedOverlayReadAccess)
+{
+    DCHECK(m_needShareTextureHandleOnGPUThread);
+    DCHECK(buffer);
+    DCHECK(scopedOverlayReadAccess);
+
+    if (!scopedOverlayReadAccess) {
+        buffer->sharedTextureHandle(INVALID_HANDLE_VALUE);
+        return;
+    }
+
+    absl::optional<gl::DCLayerOverlayImage> overlayImage =
+            scopedOverlayReadAccess->GetDCLayerOverlayImage();
+    if (!overlayImage) {
+        qWarning("D3D: No overlay image.");
+        buffer->sharedTextureHandle(INVALID_HANDLE_VALUE);
+        return;
+    }
+
+    Q_ASSERT(overlayImage->type() == gl::DCLayerOverlayType::kNV12Texture);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> chromeTexture = overlayImage->nv12_texture();
+    if (!chromeTexture) {
+        qWarning("D3D: No D3D texture.");
+        buffer->sharedTextureHandle(INVALID_HANDLE_VALUE);
+        return;
+    }
+
+    HRESULT hr;
+
+    Microsoft::WRL::ComPtr<IDXGIResource1> dxgiResource;
+    hr = chromeTexture->QueryInterface(IID_PPV_ARGS(&dxgiResource));
+    Q_ASSERT(SUCCEEDED(hr));
+
+    HANDLE sharedHandle = INVALID_HANDLE_VALUE;
+    hr = dxgiResource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr,
+                                          &sharedHandle);
+    Q_ASSERT(SUCCEEDED(hr));
+    Q_ASSERT(sharedHandle != INVALID_HANDLE_VALUE);
+
+    buffer->sharedTextureHandle(sharedHandle);
 }
 
 } // namespace QtWebEngineCore

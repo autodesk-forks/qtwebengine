@@ -126,10 +126,23 @@ protected:
         gfx::ScopedIOSurface ioSurface() const;
 #endif
 
+#if defined(Q_OS_WIN)
+        void sharedTextureHandle(HANDLE textureHandle);
+        HANDLE sharedTextureHandle() const;
+#endif
+
         const Shape &shape() const { return m_shape; }
         viz::SharedImageFormat sharedImageFormat() const { return m_skiaRepresentation->format(); }
 
         std::function<void()> textureCleanupCallback;
+        std::function<void()> textureMutexAcquireCallback;
+        std::function<void()> textureMutexReleaseCallback;
+        std::function<void()> textureMutexCleanupCallback;
+
+        void shareTextureHandleOnGPUThread();
+        void acquireTextureMutex();
+        void releaseTextureMutex();
+        void cleanupTextureMutex();
 
     private:
         void createSkImageOnGPUThread();
@@ -148,16 +161,26 @@ protected:
                 m_scopedOverlayReadAccess;
         std::vector<GrBackendSemaphore> m_endSemaphores;
         int m_presentCount = 0;
+        int m_textureMutexAcquireCount = 0;
 
         mutable QMutex m_skImageMutex;
         sk_sp<SkImage> m_cachedSkImage;
+
+#if defined(Q_OS_WIN)
+        base::win::ScopedHandle m_textureHandle;
+#endif
     };
+
+    virtual void shareTextureHandleOnGPUThreadImplementation(
+            Buffer *buffer,
+            gpu::OverlayImageRepresentation::ScopedReadAccess *scopedOverlayReadAccess) {}
 
 protected:
     scoped_refptr<gpu::SharedContextState> m_contextState;
     std::unique_ptr<Buffer> m_frontBuffer;
     bool m_readyWithTexture = false;
     bool m_isNativeBufferSupported = true;
+    bool m_needShareTextureHandleOnGPUThread = false;
 
 private:
     friend class NativeSkiaOutputDevice::Buffer;
